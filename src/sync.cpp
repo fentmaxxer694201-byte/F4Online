@@ -1223,8 +1223,9 @@ namespace
 		}
 		actor->SetPosition(g_shownPos, true);
 		actor->SetAngleOnReference({ 0.0f, 0.0f, g_shownYaw });
-		// Drive the locomotion blend so it walks/runs instead of sliding.
-		actor->SetGraphVariableFloat("Speed", p.speed);
+		// The sender's graph "Speed" is 0 while walking (it's the target gait), so drive the blend with the real ground speed.
+		const float groundSpeed = std::sqrt(remote.vx * remote.vx + remote.vy * remote.vy);
+		actor->SetGraphVariableFloat("Speed", groundSpeed > 20.0f ? groundSpeed : 0.0f);
 		actor->SetGraphVariableFloat("Direction", p.dir);
 		actor->SetGraphVariableBool("IsSprinting", p.sprint != 0);
 		// Weapon out/away like the peer (NPCs don't show holstered guns). Act once per change: re-drawing
@@ -1252,6 +1253,13 @@ namespace
 			puppetSprinting = p.sprint != 0;
 			const bool ok = actor->NotifyAnimationGraphImpl(puppetSprinting ? "sprintStart" : "sprintStop");
 			REX::INFO("Puppet {} sprint (graph accepted event: {})", puppetSprinting ? "starts" : "stops", ok);
+		}
+		// NPCs only leave the idle pose on moveStart, which their AI never sends (SetPosition looks like standing still).
+		static bool puppetMoving = false;
+		if ((groundSpeed > 20.0f) != puppetMoving) {
+			puppetMoving = groundSpeed > 20.0f;
+			const bool ok = actor->NotifyAnimationGraphImpl(puppetMoving ? "moveStart" : "moveStop");
+			REX::INFO("Puppet {} moving at {:.0f} (graph accepted event: {})", puppetMoving ? "starts" : "stops", groundSpeed, ok);
 		}
 
 		static auto lastLog = std::chrono::steady_clock::now();
