@@ -12,3 +12,8 @@ vs*/
 # files
 *.zip
 compile_commands.json
+
+# private: notes, test files, personal addresses
+MODLOG.md
+HANDOFF-PROMPT.md
+dist/
