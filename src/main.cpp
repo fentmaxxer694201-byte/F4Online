@@ -28,7 +28,7 @@ namespace
 		cfg.animProbe = GetPrivateProfileIntA("Debug", "AnimProbe", 0, path.c_str()) != 0;
 		cfg.realFace = GetPrivateProfileIntA("Debug", "RealFace", 1, path.c_str()) != 0;
 		cfg.faceMode = GetPrivateProfileIntA("Debug", "FaceMode", 3, path.c_str());
-		cfg.building = GetPrivateProfileIntA("Debug", "Building", 0, path.c_str()) != 0;
+		cfg.building = GetPrivateProfileIntA("Debug", "Building", 1, path.c_str()) != 0;
 		GetPrivateProfileStringA("Debug", "FaceFile", "", buf, sizeof(buf), path.c_str());
 		cfg.faceFile = buf;
 		GetPrivateProfileStringA("Debug", "PuppetBase", "", buf, sizeof(buf), path.c_str());
