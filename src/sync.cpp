@@ -309,8 +309,66 @@ namespace
 		}
 	}
 
+	// The NPC graph's Speed is AIProcess::GetDesiredSpeed (MODLOG 0.11.6), which the puppet's idle AI keeps at 0.
+	// Both the getter and the AI's setter are tiny (read/write middleHigh+0x428), so we replace them whole: same
+	// behaviour for every actor, except the puppet reports the peer's ground speed.
+	std::atomic<RE::AIProcess*> g_puppetProc{ nullptr };
+	std::atomic<float>          g_puppetSpeed{ 0.0f };
+
+	float* DesiredSpeedSlot(RE::AIProcess* a_proc)
+	{
+		const auto mh = a_proc->middleHigh;
+		return mh ? reinterpret_cast<float*>(reinterpret_cast<std::uintptr_t>(mh) + 0x428) : nullptr;
+	}
+
+	float HookGetDesiredSpeed(RE::AIProcess* a_proc)
+	{
+		if (a_proc == g_puppetProc.load()) {
+			return g_puppetSpeed.load();
+		}
+		const auto slot = DesiredSpeedSlot(a_proc);
+		return slot ? *slot : 0.0f;
+	}
+
+	void HookSetDesiredSpeed(RE::AIProcess* a_proc, float a_speed)
+	{
+		if (const auto slot = DesiredSpeedSlot(a_proc)) {
+			*slot = a_proc == g_puppetProc.load() ? g_puppetSpeed.load() : a_speed;
+		}
+	}
+
+	// Overwrites the start of a function with an absolute jump, only if its bytes are what we analysed (1.11.240).
+	bool JumpTo(REL::ID a_id, std::span<const std::uint8_t> a_expect, void* a_to)
+	{
+		const auto at = reinterpret_cast<std::uint8_t*>(a_id.address());
+		if (std::memcmp(at, a_expect.data(), a_expect.size()) != 0) {
+			REX::ERROR("Hook {}: unexpected code at Fallout4.exe+{:X}, not patched", a_id.id(), a_id.offset());
+			return false;
+		}
+		std::uint8_t jmp[14] = { 0xFF, 0x25, 0, 0, 0, 0 };  // jmp [rip+0] ; <8-byte target>
+		const auto   to = reinterpret_cast<std::uintptr_t>(a_to);
+		std::memcpy(jmp + 6, &to, sizeof(to));
+		DWORD old = 0;
+		VirtualProtect(at, sizeof(jmp), PAGE_EXECUTE_READWRITE, &old);
+		std::memcpy(at, jmp, sizeof(jmp));
+		VirtualProtect(at, sizeof(jmp), old, &old);
+		FlushInstructionCache(GetCurrentProcess(), at, sizeof(jmp));
+		return true;
+	}
+
+	void InstallSpeedHooks()
+	{
+		// mov rax,[rcx+8]; test rax,rax; je +n; movss xmm0/[rax+428h] <-> ...; ret  (18 bytes, padding after)
+		static constexpr std::uint8_t kGet[] = { 0x48, 0x8B, 0x41, 0x08, 0x48, 0x85, 0xC0, 0x74, 0x09, 0xF3, 0x0F, 0x10, 0x80, 0x28, 0x04, 0x00, 0x00, 0xC3 };
+		static constexpr std::uint8_t kSet[] = { 0x48, 0x8B, 0x41, 0x08, 0x48, 0x85, 0xC0, 0x74, 0x08, 0xF3, 0x0F, 0x11, 0x88, 0x28, 0x04, 0x00, 0x00, 0xC3 };
+		const bool get = JumpTo(REL::ID{ 2232364 }, kGet, reinterpret_cast<void*>(&HookGetDesiredSpeed));
+		const bool set = JumpTo(REL::ID{ 2232365 }, kSet, reinterpret_cast<void*>(&HookSetDesiredSpeed));
+		REX::INFO("Puppet speed hooks: get={} set={}", get, set);
+	}
+
 	void DespawnPuppet()
 	{
+		g_puppetProc = nullptr;
 		if (auto ref = g_puppet.get()) {
 			ref->Disable();
 			ref->SetDelete(true);
@@ -650,6 +708,12 @@ namespace
 					out += std::format(" {}=i{}", v, i);
 				}
 			}
+			if (const auto proc = a->currentProcess; proc && proc->high) {
+				const auto& c = proc->high->pathingCurrentMovementSpeed;
+				const auto& d = proc->high->pathingDesiredMovementSpeed;
+				out += std::format(" | pathCur=({:.0f},{:.0f},{:.0f}) pathWant=({:.0f},{:.0f},{:.0f})", c.x, c.y, c.z, d.x, d.y, d.z);
+			}
+			out += std::format(" desiredSpeed={:.0f}", a->GetDesiredSpeed());
 			return out;
 		};
 		static auto          last = std::chrono::steady_clock::now();
@@ -1225,6 +1289,8 @@ namespace
 		actor->SetAngleOnReference({ 0.0f, 0.0f, g_shownYaw });
 		// The sender's graph "Speed" is 0 while walking (it's the target gait), so drive the blend with the real ground speed.
 		const float groundSpeed = std::sqrt(remote.vx * remote.vx + remote.vy * remote.vy);
+		g_puppetSpeed = groundSpeed > 20.0f ? groundSpeed : 0.0f;  // read by the GetDesiredSpeed hook
+		g_puppetProc = actor->currentProcess;
 		actor->SetGraphVariableFloat("Speed", groundSpeed > 20.0f ? groundSpeed : 0.0f);
 		actor->SetGraphVariableFloat("Direction", p.dir);
 		actor->SetGraphVariableBool("IsSprinting", p.sprint != 0);
@@ -1351,6 +1417,7 @@ namespace Sync
 		if (g_cfg.mode == Mode::kOff || !OpenSocket()) {
 			return;
 		}
+		InstallSpeedHooks();
 		switch (g_cfg.mode) {
 		case Mode::kHost: REX::INFO("Hosting on UDP {}", g_cfg.port); break;
 		case Mode::kJoin: REX::INFO("Joining {}", Addr(g_peer)); break;
