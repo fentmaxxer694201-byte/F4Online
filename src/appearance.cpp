@@ -7,7 +7,50 @@ namespace
 	constexpr std::size_t kMaxMorphs = 512;
 	constexpr std::size_t kMaxRegions = 256;
 	constexpr std::size_t kMaxBones = 256;
-	constexpr std::uint8_t kVersion = 1;
+	constexpr std::size_t kMaxTints = 128;
+	constexpr std::uint8_t kVersion = 2;  // 2 adds body tint + tint layers (skin tone, makeup); 1 is still read
+
+	// One tint layer as sent: which layer (idLink), strength, and for palette layers the color and swatch.
+	struct Tint
+	{
+		std::uint16_t idLink;
+		std::uint8_t  value;
+		std::uint8_t  palette;
+		std::uint32_t color;
+		std::uint16_t swatch;
+	};
+
+	bool IsPalette(RE::BGSCharacterTint::Entry* a_entry) { return a_entry->GetType() == RE::BGSCharacterTint::EntryType::kPalette; }
+
+	// The copy shares the player's tint list after Copy(); give it its own: clone each entry of the player's
+	// list (same layers, same templates) and set the peer's values on the layers they share.
+	// shortcut: layers the peer has but the local player doesn't are skipped (logged); upgrade: create entries from templates.
+	RE::BGSCharacterTint::Entries* CloneTints(const RE::BGSCharacterTint::Entries* a_from, const std::vector<Tint>& a_tints, std::size_t& a_applied)
+	{
+		auto out = new (RE::malloc(sizeof(RE::BGSCharacterTint::Entries))) RE::BGSCharacterTint::Entries();
+		a_applied = 0;
+		if (!a_from) {
+			return out;
+		}
+		for (const auto src : a_from->entriesA) {
+			if (!src) {
+				continue;
+			}
+			const std::size_t size = IsPalette(src) ? sizeof(RE::BGSCharacterTint::PaletteEntry) : sizeof(RE::BGSCharacterTint::Entry);
+			const auto        e = static_cast<RE::BGSCharacterTint::Entry*>(RE::malloc(size));
+			std::memcpy(e, src, size);  // vtable + template pointer + values: a plain-data copy of the engine's own entry
+			if (const auto it = std::ranges::find(a_tints, e->idLink, &Tint::idLink); it != a_tints.end()) {
+				e->tingingValue = it->value;
+				if (it->palette && IsPalette(e)) {
+					static_cast<RE::BGSCharacterTint::PaletteEntry*>(e)->tintingColor = it->color;
+					static_cast<RE::BGSCharacterTint::PaletteEntry*>(e)->swatchID = it->swatch;
+				}
+				++a_applied;
+			}
+			out->entriesA.push_back(e);
+		}
+		return out;
+	}
 
 	class Writer
 	{
@@ -121,6 +164,21 @@ namespace Appearance
 				w.Put(sorted[i].second);
 			}
 		}
+
+		w.Put(a_npc->bodyTintColorR), w.Put(a_npc->bodyTintColorG), w.Put(a_npc->bodyTintColorB), w.Put(a_npc->bodyTintColorA);
+		std::vector<Tint> tints;
+		if (a_npc->tintingData) {
+			for (const auto e : a_npc->tintingData->entriesA) {
+				if (e && tints.size() < kMaxTints) {
+					const auto pal = IsPalette(e) ? static_cast<RE::BGSCharacterTint::PaletteEntry*>(e) : nullptr;
+					tints.push_back({ e->idLink, e->tingingValue, static_cast<std::uint8_t>(pal != nullptr), pal ? pal->tintingColor : 0u, pal ? pal->swatchID : std::uint16_t{ 0 } });
+				}
+			}
+		}
+		w.Put(static_cast<std::uint8_t>(tints.size()));
+		for (const auto& tint : tints) {
+			w.Put(tint.idLink), w.Put(tint.value), w.Put(tint.palette), w.Put(tint.color), w.Put(tint.swatch);
+		}
 		return w.bytes;
 	}
 
@@ -131,7 +189,7 @@ namespace Appearance
 		std::uint32_t  raceID = 0, hairID = 0, facialHairID = 0, detailsID = 0;
 		RE::NiPoint3   weight;
 		float          height = 1.0f;
-		if (!r.Get(version) || version != kVersion || !r.Get(raceID) || !r.Get(female) || female > 1 ||
+		if (!r.Get(version) || (version != 1 && version != kVersion) || !r.Get(raceID) || !r.Get(female) || female > 1 ||
 			!r.Get(weight.x) || !r.Get(weight.y) || !r.Get(weight.z) || !r.Get(height) ||
 			!Finite(weight.x) || !Finite(weight.y) || !Finite(weight.z) || !Finite(height) || height <= 0.0f || height > 3.0f ||
 			!r.Get(hairID) || !r.Get(facialHairID) || !r.Get(detailsID) || !r.Get(nParts) || nParts > kMaxHeadParts) {
@@ -192,6 +250,22 @@ namespace Appearance
 				!Finite(t.scale.x) || !Finite(t.scale.y) || !Finite(t.scale.z)) {
 				REX::WARN("Look: bad bone");
 				return nullptr;
+			}
+		}
+		std::int8_t       body[4]{};
+		std::uint8_t      nTint = 0;
+		std::vector<Tint> tints;
+		if (version >= 2) {
+			if (!r.Get(body[0]) || !r.Get(body[1]) || !r.Get(body[2]) || !r.Get(body[3]) || !r.Get(nTint) || nTint > kMaxTints) {
+				REX::WARN("Look: bad tint header");
+				return nullptr;
+			}
+			tints.resize(nTint);
+			for (auto& tint : tints) {
+				if (!r.Get(tint.idLink) || !r.Get(tint.value) || !r.Get(tint.palette) || !r.Get(tint.color) || !r.Get(tint.swatch) || tint.palette > 1) {
+					REX::WARN("Look: bad tint");
+					return nullptr;
+				}
 			}
 		}
 		if (!r.AtEnd()) {
@@ -265,8 +339,14 @@ namespace Appearance
 		}
 		npc->facialBoneRegionSliderValues = boneMap;
 
-		REX::INFO("Look: built NPC {:08X} ({}, {} head parts, {} morphs, {} regions, {} bones, weight {:.2f}/{:.2f}/{:.2f})",
-			npc->GetFormID(), female ? "female" : "male", parts.size(), morphs.size(), regions.size(), bones.size(), weight.x, weight.y, weight.z);
+		std::size_t appliedTints = 0;
+		if (version >= 2) {  // version 1 (older saved looks): keep the local player's tints, as before
+			npc->bodyTintColorR = body[0], npc->bodyTintColorG = body[1], npc->bodyTintColorB = body[2], npc->bodyTintColorA = body[3];
+			npc->tintingData = CloneTints(player->tintingData, tints, appliedTints);
+		}
+
+		REX::INFO("Look: built NPC {:08X} ({}, {} head parts, {} morphs, {} regions, {} bones, {}/{} tints, weight {:.2f}/{:.2f}/{:.2f})",
+			npc->GetFormID(), female ? "female" : "male", parts.size(), morphs.size(), regions.size(), bones.size(), appliedTints, tints.size(), weight.x, weight.y, weight.z);
 		return npc;
 	}
 
@@ -304,6 +384,9 @@ namespace Appearance
 		std::swap(a_a->facialBoneRegionSliderValues, a_b->facialBoneRegionSliderValues);
 		std::swap(a_a->headRelatedData, a_b->headRelatedData);
 		std::swap(a_a->morphWeight, a_b->morphWeight);
+		std::swap(a_a->tintingData, a_b->tintingData);
+		std::swap(a_a->bodyTintColorR, a_b->bodyTintColorR), std::swap(a_a->bodyTintColorG, a_b->bodyTintColorG);
+		std::swap(a_a->bodyTintColorB, a_b->bodyTintColorB), std::swap(a_a->bodyTintColorA, a_b->bodyTintColorA);
 	}
 
 	void SelfTest(RE::TESNPC* a_npc, bool a_female)

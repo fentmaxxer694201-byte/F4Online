@@ -1,8 +1,7 @@
 #pragma once
 
 // A player's chargen look (race, sex, weight, head parts, colors, face sliders and bones) as bytes,
-// and a runtime NPC built from them. Skin tints are not included yet (the copy keeps the local
-// player's tints).
+// and a runtime NPC built from them, including skin tone and tint layers (version 2).
 namespace Appearance
 {
 	std::vector<std::uint8_t> Serialize(RE::TESNPC* a_npc, bool a_female);
