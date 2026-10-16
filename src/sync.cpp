@@ -9,8 +9,8 @@
 namespace
 {
 	// Wire format. Fixed size, little-endian (both ends are x64 Windows).
-	constexpr std::uint32_t kMagic = 0x384F3446;  // "F4O8" (0.11.8: gifts carry weapon/armor mods; older builds would drop them)
-	enum class Type : std::uint8_t { kState = 1, kKill = 2, kDamage = 3, kXP = 4, kName = 5, kGive = 6, kLook = 7, kFace = 8, kBuild = 9 };
+	constexpr std::uint32_t kMagic = 0x394F3446;  // "F4O9" (0.11.9: shared enemies)
+	enum class Type : std::uint8_t { kState = 1, kKill = 2, kDamage = 3, kXP = 4, kName = 5, kGive = 6, kLook = 7, kFace = 8, kBuild = 9, kEnemies = 10, kEnemyHit = 11 };
 
 #pragma pack(push, 1)
 	struct Packet
@@ -109,8 +109,39 @@ namespace
 		std::uint8_t  interior;
 	};
 
+	// Hostile actors fighting near the sender's player; the receiver shows copies of them.
+	constexpr int kMaxEnemies = 16;
+#pragma pack(push, 1)
+	struct EnemyPacket
+	{
+		std::uint32_t magic;
+		Type          type;
+		std::uint32_t seq;
+		std::uint32_t area;  // sender's interior cell or worldspace
+		std::uint8_t  interior;
+		std::uint8_t  count;
+		struct Entry
+		{
+			RE::TESFormID id;    // the sender's actor: names the enemy across both games
+			RE::TESFormID base;  // NPC to spawn a copy from
+			float         x, y, z, yaw;
+			float         health;  // 0..1 of max
+			std::uint8_t  dead;
+		} e[kMaxEnemies];
+	};
+
+	struct EnemyHitPacket
+	{
+		std::uint32_t magic;
+		Type          type;
+		RE::TESFormID id;      // the receiver's own actor (from its EnemyPacket)
+		float         amount;  // health our hit on the copy took off
+		std::uint8_t  kill;    // the copy died here
+	};
+#pragma pack(pop)
+
 	constexpr std::size_t kRecvBuf = 2048;
-	static_assert(sizeof(LookPacket) <= kRecvBuf && sizeof(Packet) <= kRecvBuf && sizeof(FacePacket) <= kRecvBuf,
+	static_assert(sizeof(LookPacket) <= kRecvBuf && sizeof(Packet) <= kRecvBuf && sizeof(FacePacket) <= kRecvBuf && sizeof(EnemyPacket) <= kRecvBuf,
 		"receive buffer in ReceiveAll must hold every packet");
 
 	struct Drop
@@ -192,6 +223,33 @@ namespace
 	std::unordered_set<RE::TESFormID> g_remoteKills;    // killed because the peer said so: don't echo back
 	std::unordered_set<RE::TESFormID> g_strayTried;     // stray puppets we already tried to remove
 
+	// Shared enemies. A copy we spawned, or our own same world-placed actor that we drive instead ("adopted").
+	struct ShownEnemy
+	{
+		RE::ObjectRefHandle                   ref;
+		bool                                  adopted{ false };
+		bool                                  dead{ false };
+		EnemyPacket::Entry                    last{};
+		std::chrono::steady_clock::time_point at{};
+		float                                 vx{ 0 }, vy{ 0 };
+		RE::NiPoint3                          pos;
+		float                                 yaw{ 0 };
+		bool                                  posValid{ false };
+		int                                   slot{ -1 };  // speed hook slot
+		bool                                  moving{ false };
+		float                                 hp{ -1.0f };  // health after our last sync; a drop below it was done here
+	};
+	std::unordered_map<RE::TESFormID, ShownEnemy>    g_shownEnemies;   // peer's actor ID -> what we show (main thread)
+	std::unordered_map<RE::TESFormID, RE::TESFormID> g_drivenByLocal;  // our actor ID -> peer's actor ID (main thread)
+	std::unordered_set<RE::TESFormID>                g_enemiesSent;    // our actors in the last EnemyPacket (main thread)
+	std::unordered_map<RE::TESFormID, std::chrono::steady_clock::time_point> g_deadSince;  // reported actors that died (main thread)
+	std::uint32_t                         g_enemySeq = 0;
+	EnemyPacket                           g_enemyPkt{};      // latest from the peer (guarded by g_lock)
+	bool                                  g_enemyNew = false;
+	std::chrono::steady_clock::time_point g_enemyAt{};
+	std::vector<EnemyHitPacket>           g_pendingEnemyHits;  // (guarded by g_lock)
+	constexpr float                       kEnemyRange = 6000.0f;  // ~85 m around the player
+
 	bool Finite(const Packet& p)
 	{
 		return std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z) && std::isfinite(p.yaw) &&
@@ -247,7 +305,18 @@ namespace
 			                                             std::isfinite(bp.x) && std::isfinite(bp.y) && std::isfinite(bp.z) &&
 			                                             std::isfinite(bp.ax) && std::isfinite(bp.ay) && std::isfinite(bp.az) &&
 			                                             std::abs(bp.x) < 1e7f && std::abs(bp.y) < 1e7f && std::abs(bp.z) < 1e7f && bp.interior <= 1);
-			if (!isState && !isKill && !isDamage && !isXP && !isName && !isGive && !isLook && !isFace && !isBuild) {
+			EnemyPacket ep{};
+			const bool  isEnemies = n == sizeof(ep) && (std::memcpy(&ep, buf, sizeof(ep)), ep.magic == kMagic && ep.type == Type::kEnemies &&
+			                                               ep.count <= kMaxEnemies && ep.interior <= 1) &&
+			                       std::all_of(ep.e, ep.e + ep.count, [](const EnemyPacket::Entry& e) {
+				                       return std::isfinite(e.x) && std::isfinite(e.y) && std::isfinite(e.z) && std::isfinite(e.yaw) &&
+				                              std::abs(e.x) < 1e7f && std::abs(e.y) < 1e7f && std::abs(e.z) < 1e7f &&
+				                              std::isfinite(e.health) && e.health >= 0.0f && e.health <= 1.0f && e.dead <= 1;
+			                       });
+			EnemyHitPacket eh{};
+			const bool     isEnemyHit = n == sizeof(eh) && (std::memcpy(&eh, buf, sizeof(eh)), eh.magic == kMagic && eh.type == Type::kEnemyHit &&
+			                                                   std::isfinite(eh.amount) && eh.amount >= 0.0f && eh.amount < 100000.0f && eh.kill <= 1);
+			if (!isState && !isKill && !isDamage && !isXP && !isName && !isGive && !isLook && !isFace && !isBuild && !isEnemies && !isEnemyHit) {
 				continue;  // not ours or malformed: drop
 			}
 			std::scoped_lock l(g_lock);
@@ -286,6 +355,20 @@ namespace
 				g_pendingBuilds.push_back(bp);
 				continue;
 			}
+			if (isEnemies) {
+				const auto now = std::chrono::steady_clock::now();
+				// newer, or the peer restarted (seq back to 0) and we've heard nothing for a while
+				if (static_cast<std::int32_t>(ep.seq - g_enemyPkt.seq) > 0 || now - g_enemyAt > std::chrono::seconds(2)) {
+					g_enemyPkt = ep;
+					g_enemyNew = true;
+					g_enemyAt = now;
+				}
+				continue;
+			}
+			if (isEnemyHit) {
+				g_pendingEnemyHits.push_back(eh);
+				continue;
+			}
 			if (isFace) {
 				if (fc.version != g_faceAssembling || g_faceParts.size() != fc.total) {
 					g_faceAssembling = fc.version;
@@ -318,9 +401,25 @@ namespace
 
 	// The NPC graph's Speed is AIProcess::GetDesiredSpeed (MODLOG 0.11.6), which the puppet's idle AI keeps at 0.
 	// Both the getter and the AI's setter are tiny (read/write middleHigh+0x428), so we replace them whole: same
-	// behaviour for every actor, except the puppet reports the peer's ground speed.
-	std::atomic<RE::AIProcess*> g_puppetProc{ nullptr };
-	std::atomic<float>          g_puppetSpeed{ 0.0f };
+	// behaviour for every actor, except the puppet and enemy copies report the speed we measured.
+	struct SpeedSlot
+	{
+		std::atomic<RE::AIProcess*> proc{ nullptr };
+		std::atomic<float>          speed{ 0.0f };
+	};
+	constexpr int kSpeedSlots = 1 + 2 * kMaxEnemies;  // [0] = puppet, the rest enemies
+	SpeedSlot     g_speedSlots[kSpeedSlots];
+	bool          g_slotUsed[kSpeedSlots]{ true };  // main thread; slot 0 is always the puppet's
+
+	SpeedSlot* SlotFor(RE::AIProcess* a_proc)
+	{
+		for (auto& s : g_speedSlots) {
+			if (s.proc.load(std::memory_order_relaxed) == a_proc) {
+				return &s;
+			}
+		}
+		return nullptr;
+	}
 
 	float* DesiredSpeedSlot(RE::AIProcess* a_proc)
 	{
@@ -330,8 +429,8 @@ namespace
 
 	float HookGetDesiredSpeed(RE::AIProcess* a_proc)
 	{
-		if (a_proc == g_puppetProc.load()) {
-			return g_puppetSpeed.load();
+		if (const auto s = SlotFor(a_proc)) {
+			return s->speed.load(std::memory_order_relaxed);
 		}
 		const auto slot = DesiredSpeedSlot(a_proc);
 		return slot ? *slot : 0.0f;
@@ -340,7 +439,8 @@ namespace
 	void HookSetDesiredSpeed(RE::AIProcess* a_proc, float a_speed)
 	{
 		if (const auto slot = DesiredSpeedSlot(a_proc)) {
-			*slot = a_proc == g_puppetProc.load() ? g_puppetSpeed.load() : a_speed;
+			const auto s = SlotFor(a_proc);
+			*slot = s ? s->speed.load(std::memory_order_relaxed) : a_speed;
 		}
 	}
 
@@ -375,7 +475,7 @@ namespace
 
 	void DespawnPuppet()
 	{
-		g_puppetProc = nullptr;
+		g_speedSlots[0].proc = nullptr;
 		if (auto ref = g_puppet.get()) {
 			ref->Disable();
 			ref->SetDelete(true);
@@ -681,7 +781,7 @@ namespace
 		}
 		g_health.clear();
 		for (const auto& h : lists->highActorHandles) {
-			if (const auto a = h.get(); a && !a->IsPlayerRef() && (a->GetFormID() >> 24) != 0xFF) {
+			if (const auto a = h.get(); a && !a->IsPlayerRef()) {  // FF too: enemy copies
 				g_health[a->GetFormID()] = Health(a.get());
 			}
 		}
@@ -1147,6 +1247,311 @@ namespace
 		}
 	}
 
+	// ---- shared enemies ------------------------------------------------------------------
+	// Each game reports hostile actors fighting near its player; the other shows them. A world-placed actor
+	// that also exists alive here is driven instead of copied (no duplicate); if both games report the same
+	// one, the host's wins. Hits on what we show go to the owner, its health and death come back.
+	// shortcut: a copy has its own leveled loot (lootable twice); copies vanish on save/area change.
+
+	// A non-runtime NPC to spawn a copy from (leveled actors run on a runtime FF base).
+	RE::TESFormID SpawnBase(RE::Actor* a_actor)
+	{
+		const auto ok = [](RE::TESForm* f) { return f && (f->GetFormID() >> 24) != 0xFF && f->Is(RE::ENUM_FORM_ID::kNPC_); };
+		if (const auto t = a_actor->GetTemplateActorBase(); ok(t)) {
+			return t->GetFormID();
+		}
+		if (const auto npc = a_actor->GetNPC()) {
+			if (const auto root = npc->GetRootFaceNPC(); ok(root)) {
+				return root->GetFormID();
+			}
+			if (ok(npc)) {
+				return npc->GetFormID();
+			}
+		}
+		return 0;
+	}
+
+	float MaxHealth(RE::Actor* a_actor)
+	{
+		const auto av = RE::ActorValue::GetSingleton();
+		return av && av->health ? a_actor->GetPermanentActorValue(*av->health) : 0.0f;
+	}
+
+	// Main thread, ~10 Hz: our enemies in combat nearby (and ones that just died, so the peer kills its copy).
+	void SendEnemies(RE::PlayerCharacter* a_player, std::uint32_t a_area, bool a_interior)
+	{
+		const auto lists = RE::ProcessLists::GetSingleton();
+		if (!lists) {
+			return;
+		}
+		const auto me = a_player->GetPosition();
+		const auto now = std::chrono::steady_clock::now();
+		const auto puppet = g_puppet.get();
+		std::vector<std::pair<float, EnemyPacket::Entry>> found;
+		for (const auto& h : lists->highActorHandles) {
+			const auto a = h.get();
+			if (!a || a->IsPlayerRef() || a.get() == puppet.get() || a->IsDisabled() || g_drivenByLocal.contains(a->GetFormID())) {
+				continue;
+			}
+			const auto id = a->GetFormID();
+			const bool dead = a->IsDead(false);
+			if (dead) {
+				if (!g_enemiesSent.contains(id) && !g_deadSince.contains(id)) {
+					continue;
+				}
+				if (now - g_deadSince.try_emplace(id, now).first->second > std::chrono::seconds(3)) {
+					continue;
+				}
+			} else if (!a->IsInCombat() || !a->GetHostileToActor(a_player)) {
+				continue;
+			}
+			const auto  pos = a->GetPosition();
+			const float d2 = (pos.x - me.x) * (pos.x - me.x) + (pos.y - me.y) * (pos.y - me.y);
+			const auto  base = SpawnBase(a.get());
+			if (d2 > kEnemyRange * kEnemyRange || !base) {
+				continue;
+			}
+			const float maxHp = MaxHealth(a.get());
+			const float hp = dead ? 0.0f : maxHp > 0.0f ? std::clamp(Health(a.get()) / maxHp, 0.0f, 1.0f) : 1.0f;
+			found.push_back({ d2, { id, base, pos.x, pos.y, pos.z, a->data.angle.z, hp, static_cast<std::uint8_t>(dead) } });
+		}
+		std::ranges::sort(found, {}, &std::pair<float, EnemyPacket::Entry>::first);
+		EnemyPacket ep{ kMagic, Type::kEnemies, ++g_enemySeq, a_area, static_cast<std::uint8_t>(a_interior), 0, {} };
+		g_enemiesSent.clear();
+		for (const auto& [d2, e] : found) {
+			if (ep.count == kMaxEnemies) {
+				break;
+			}
+			ep.e[ep.count++] = e;
+			g_enemiesSent.insert(e.id);
+		}
+		std::erase_if(g_deadSince, [&](const auto& kv) { return now - kv.second > std::chrono::seconds(10); });
+		SendTo(&ep, sizeof(ep));  // empty lists too: cheap on a LAN, and the peer's view stays current
+	}
+
+	void FreeSlot(ShownEnemy& a_s)
+	{
+		if (a_s.slot > 0) {
+			g_speedSlots[a_s.slot].proc = nullptr;
+			g_slotUsed[a_s.slot] = false;
+		}
+		a_s.slot = -1;
+	}
+
+	void ReleaseEnemy(ShownEnemy& a_s, bool a_delete)
+	{
+		FreeSlot(a_s);
+		if (const auto ref = a_s.ref.get()) {
+			g_drivenByLocal.erase(ref->GetFormID());
+			if (a_delete && !a_s.adopted) {
+				ref->Disable();
+				ref->SetDelete(true);
+			}
+		}
+	}
+
+	void DropEnemies(bool a_delete)
+	{
+		for (auto& [id, s] : g_shownEnemies) {
+			ReleaseEnemy(s, a_delete);
+		}
+		g_shownEnemies.clear();
+		g_drivenByLocal.clear();
+	}
+
+	RE::ObjectRefHandle SpawnEnemyCopy(const EnemyPacket::Entry& a_e, RE::TESObjectCELL* a_cell)
+	{
+		const auto base = RE::TESForm::GetFormByID<RE::TESNPC>(a_e.base);
+		if (!base) {
+			REX::WARN("Peer's enemy {:08X}: NPC {:08X} not found here", a_e.id, a_e.base);
+			return {};
+		}
+		RE::NEW_REFR_DATA d;
+		d.location = { a_e.x + (g_cfg.mode == Mode::kEcho ? kEchoOffset : 0.0f), a_e.y, a_e.z };
+		d.direction = { 0.0f, 0.0f, a_e.yaw };
+		d.object = base;
+		d.clearStillLoadingFlag = true;
+		d.interior = a_cell->IsInterior() ? a_cell : nullptr;
+		d.world = a_cell->IsInterior() ? nullptr : a_cell->worldSpace;
+		return RE::TESDataHandler::GetSingleton()->CreateReferenceAtLocation(d);
+	}
+
+	// Main thread: show the peer's enemies (new data at ~10 Hz) and glide them every tick, like the puppet.
+	void UpdateEnemies(RE::TESObjectCELL* a_cell, std::uint32_t a_area, bool a_interior)
+	{
+		static std::uint32_t shownArea = 0;
+		static bool          shownInterior = false;
+		if (a_area != shownArea || a_interior != shownInterior) {
+			DropEnemies(true);
+			shownArea = a_area;
+			shownInterior = a_interior;
+		}
+		EnemyPacket ep;
+		bool        fresh;
+		{
+			std::scoped_lock l(g_lock);
+			fresh = std::exchange(g_enemyNew, false);
+			ep = g_enemyPkt;
+		}
+		const auto now = std::chrono::steady_clock::now();
+		const auto av = RE::ActorValue::GetSingleton();
+		for (int i = 0; fresh && ep.area == a_area && ep.interior == static_cast<std::uint8_t>(a_interior) && i < ep.count; ++i) {
+			const auto& e = ep.e[i];
+			auto        it = g_shownEnemies.find(e.id);
+			if (it == g_shownEnemies.end()) {
+				if (e.dead) {
+					continue;  // died before we ever showed it
+				}
+				ShownEnemy s;
+				const auto local = (e.id >> 24) != 0xFF && g_cfg.mode != Mode::kEcho ? RE::TESForm::GetFormByID<RE::Actor>(e.id) : nullptr;
+				if (local && !local->IsDead(false) && !local->IsPlayerRef() && !local->IsDisabled()) {
+					if (g_cfg.mode == Mode::kHost && g_enemiesSent.contains(e.id)) {
+						continue;  // we both fight it: the host's version wins
+					}
+					s.ref = local->GetHandle();
+					s.adopted = true;
+				} else {
+					s.ref = SpawnEnemyCopy(e, a_cell);
+				}
+				const auto ref = s.ref.get();
+				if (!ref) {
+					continue;
+				}
+				g_drivenByLocal[ref->GetFormID()] = e.id;
+				REX::INFO("Peer's enemy {:08X} ({}) {} {:08X}", e.id, ItemName(ref->GetObjectReference()),
+					s.adopted ? "is the same actor here: driving" : "copied as", ref->GetFormID());
+				it = g_shownEnemies.emplace(e.id, s).first;
+			}
+			auto&       s = it->second;
+			const float dt = std::chrono::duration<float>(now - s.at).count();
+			if (s.at != std::chrono::steady_clock::time_point{} && dt > 0.02f && dt < 1.0f) {
+				s.vx = 0.5f * s.vx + 0.5f * (e.x - s.last.x) / dt;
+				s.vy = 0.5f * s.vy + 0.5f * (e.y - s.last.y) / dt;
+			}
+			s.last = e;
+			s.at = now;
+			const auto actor = s.ref.get() ? s.ref.get()->As<RE::Actor>() : nullptr;
+			if (!actor || s.dead || actor->IsDead(false)) {
+				continue;
+			}
+			if (e.dead) {
+				if (!MenuOpen()) {  // else next packet (dead is sent for 3 s)
+					g_remoteKills.insert(actor->GetFormID());
+					RE::Console::ExecuteCommand(std::format("{:08X}.kill", actor->GetFormID()).c_str());
+					s.dead = true;
+					FreeSlot(s);
+					REX::INFO("Peer's enemy {:08X} died -> killed {:08X} here", e.id, actor->GetFormID());
+				}
+				continue;
+			}
+			const float want = e.health * MaxHealth(actor);
+			const float diff = want - Health(actor);
+			if (av && av->health && want >= 1.0f && std::abs(diff) >= 1.0f) {
+				actor->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, *av->health, diff);
+			}
+			s.hp = Health(actor);
+		}
+
+		int adopted = 0;
+		for (auto it = g_shownEnemies.begin(); it != g_shownEnemies.end();) {
+			auto&      s = it->second;
+			const auto ref = s.ref.get();
+			const auto actor = ref ? ref->As<RE::Actor>() : nullptr;
+			if (!actor || (!s.dead && now - s.at > std::chrono::seconds(2))) {  // peer stopped reporting it; corpses stay
+				ReleaseEnemy(s, true);
+				it = g_shownEnemies.erase(it);
+				continue;
+			}
+			adopted += s.adopted;
+			if (s.dead || actor->IsDead(false)) {
+				s.dead = true;
+				FreeSlot(s);
+				++it;
+				continue;
+			}
+			// The game's hit event never reached us (MODLOG), so damage done here shows up as a health drop.
+			if (const float cur = Health(actor); s.hp >= 0.0f && cur < s.hp - 0.5f) {
+				const EnemyHitPacket h{ kMagic, Type::kEnemyHit, it->first, s.hp - cur, 0 };
+				SendTo(&h, sizeof(h));
+				REX::INFO("Hit peer's enemy {:08X} here for {:.1f} -> sent", it->first, s.hp - cur);
+			}
+			s.hp = Health(actor);
+			if (s.slot < 0) {
+				for (int i = 1; i < kSpeedSlots && s.slot < 0; ++i) {
+					if (!g_slotUsed[i]) {
+						g_slotUsed[i] = true;
+						s.slot = i;
+					}
+				}
+			}
+			const float        ahead = (std::min)(std::chrono::duration<float>(now - s.at).count(), 0.25f);
+			const float        ex = s.last.x + (g_cfg.mode == Mode::kEcho ? kEchoOffset : 0.0f);
+			const RE::NiPoint3 target{ ex + s.vx * ahead, s.last.y + s.vy * ahead, s.last.z };
+			const float        gap = std::sqrt((target.x - s.pos.x) * (target.x - s.pos.x) + (target.y - s.pos.y) * (target.y - s.pos.y));
+			if (!s.posValid || gap > 800.0f) {
+				s.pos = target;
+				s.yaw = s.last.yaw;
+				s.posValid = true;
+			} else {
+				constexpr float k = 0.35f;
+				s.pos.x += (target.x - s.pos.x) * k;
+				s.pos.y += (target.y - s.pos.y) * k;
+				s.pos.z += (target.z - s.pos.z) * k;
+				s.yaw += std::remainder(s.last.yaw - s.yaw, 6.2831853f) * k;
+			}
+			actor->SetPosition(s.pos, true);
+			actor->SetAngleOnReference({ 0.0f, 0.0f, s.yaw });
+			const float ground = std::sqrt(s.vx * s.vx + s.vy * s.vy);
+			const float speed = ground > 20.0f ? ground : 0.0f;
+			if (s.slot > 0) {
+				g_speedSlots[s.slot].speed = speed;
+				g_speedSlots[s.slot].proc = actor->currentProcess;
+			}
+			actor->SetGraphVariableFloat("Speed", speed);
+			if ((speed > 0.0f) != s.moving) {
+				s.moving = speed > 0.0f;
+				actor->NotifyAnimationGraphImpl(s.moving ? "moveStart" : "moveStop");
+			}
+			++it;
+		}
+
+		static auto lastLog = now;
+		if (now - lastLog > std::chrono::seconds(5) && (!g_shownEnemies.empty() || !g_enemiesSent.empty())) {
+			lastLog = now;
+			REX::INFO("Enemies: reporting {} of ours, showing {} of the peer's ({} driven, {} copies)", g_enemiesSent.size(),
+				g_shownEnemies.size(), adopted, g_shownEnemies.size() - adopted);
+		}
+	}
+
+	// Main thread: hits and deaths of our enemies that happened to the peer's copies.
+	void ApplyEnemyHits()
+	{
+		if (MenuOpen()) {
+			return;
+		}
+		std::vector<EnemyHitPacket> hits;
+		{
+			std::scoped_lock l(g_lock);
+			hits.swap(g_pendingEnemyHits);
+		}
+		const auto av = RE::ActorValue::GetSingleton();
+		for (const auto& h : hits) {
+			const auto actor = RE::TESForm::GetFormByID<RE::Actor>(h.id);
+			if (!actor || actor->IsDead(false) || actor->IsPlayerRef() || g_drivenByLocal.contains(h.id) || g_remoteKills.contains(h.id) || !av || !av->health) {
+				continue;  // gone, already dead, or not ours
+			}
+			const float before = Health(actor);
+			if (h.kill || h.amount >= before) {
+				g_remoteKills.insert(h.id);
+				RE::Console::ExecuteCommand(std::format("{:08X}.kill", h.id).c_str());
+				REX::INFO("Peer killed our enemy {:08X} -> killed here", h.id);
+			} else {
+				actor->ModActorValue(RE::ACTOR_VALUE_MODIFIER::kDamage, *av->health, -h.amount);
+				REX::INFO("Peer hit our enemy {:08X} for {:.1f}: health {:.1f} -> {:.1f}", h.id, h.amount, before, Health(actor));
+			}
+		}
+	}
+
 	class HitSink : public RE::BSTEventSink<RE::TESHitEvent>
 	{
 	public:
@@ -1154,9 +1559,16 @@ namespace
 		{
 			const auto cause = a_event.cause.get();
 			const auto target = a_event.target.get();
+			static int seen = 0;
+			if (++seen <= 10) {
+				REX::INFO("Hit event: target {:08X} cause {:08X} usesHitData={}", target ? target->GetFormID() : 0, cause ? cause->GetFormID() : 0, a_event.usesHitData);
+			}
 			const auto actor = target ? target->As<RE::Actor>() : nullptr;
-			if (!cause || !cause->IsPlayerRef() || !actor || actor->IsPlayerRef() || (actor->GetFormID() >> 24) == 0xFF || actor->IsDead(false)) {
-				return RE::BSEventNotifyControl::kContinue;  // only our hits on world-placed, living actors
+			if (!cause || !cause->IsPlayerRef() || !actor || actor->IsPlayerRef() || actor->IsDead(false)) {
+				return RE::BSEventNotifyControl::kContinue;  // only our hits on living actors
+			}
+			if ((actor->GetFormID() >> 24) == 0xFF || g_drivenByLocal.contains(actor->GetFormID())) {
+				return RE::BSEventNotifyControl::kContinue;  // runtime actors exist only here; shared enemies report their own damage
 			}
 			// The event fires after the damage is applied, so "before" comes from last tick's record.
 			const auto it = g_health.find(actor->GetFormID());
@@ -1173,12 +1585,23 @@ namespace
 		RE::BSEventNotifyControl ProcessEvent(const RE::TESDeathEvent& a_event, RE::BSTEventSource<RE::TESDeathEvent>*) override
 		{
 			const auto dying = a_event.actorDying.get();
-			if (!a_event.dead || !dying || dying->IsPlayerRef() || (dying->GetFormID() >> 24) == 0xFF) {
-				return RE::BSEventNotifyControl::kContinue;  // only finished deaths of world-placed actors
+			if (!a_event.dead || !dying || dying->IsPlayerRef()) {
+				return RE::BSEventNotifyControl::kContinue;
 			}
 			const auto id = dying->GetFormID();
 			if (g_remoteKills.erase(id)) {
 				return RE::BSEventNotifyControl::kContinue;  // the peer killed it; don't bounce it back
+			}
+			if (const auto it = g_drivenByLocal.find(id); it != g_drivenByLocal.end()) {  // a shared enemy died here
+				const EnemyHitPacket h{ kMagic, Type::kEnemyHit, it->second, 0.0f, 1 };
+				for (int i = 0; i < 3; ++i) {  // UDP can drop; a second kill is ignored
+					SendTo(&h, sizeof(h));
+				}
+				REX::INFO("Shared enemy {:08X} (peer's {:08X}) died here -> telling peer", id, it->second);
+				return RE::BSEventNotifyControl::kContinue;
+			}
+			if ((id >> 24) == 0xFF) {
+				return RE::BSEventNotifyControl::kContinue;  // only finished deaths of world-placed actors
 			}
 			REX::INFO("{:08X} died here -> telling peer", id);
 			SendKill(id);
@@ -1227,6 +1650,15 @@ namespace
 		ReceiveGifts(player);
 		g_step = "ApplyBuilds";
 		ApplyBuilds();
+		g_step = "ApplyEnemyHits";
+		ApplyEnemyHits();
+		g_step = "UpdateEnemies";
+		UpdateEnemies(cell, area, interior);
+		static int enemyTick = 0;
+		if (++enemyTick % 6 == 0) {  // ~10 Hz
+			g_step = "SendEnemies";
+			SendEnemies(player, area, interior);
+		}
 		static int buildCheck = 0;
 		if (++buildCheck % 60 == 0) {  // ~1 s
 			CheckMyBuilds();
@@ -1333,8 +1765,8 @@ namespace
 		actor->SetAngleOnReference({ 0.0f, 0.0f, g_shownYaw });
 		// The sender's graph "Speed" is 0 while walking (it's the target gait), so drive the blend with the real ground speed.
 		const float groundSpeed = std::sqrt(remote.vx * remote.vx + remote.vy * remote.vy);
-		g_puppetSpeed = groundSpeed > 20.0f ? groundSpeed : 0.0f;  // read by the GetDesiredSpeed hook
-		g_puppetProc = actor->currentProcess;
+		g_speedSlots[0].speed = groundSpeed > 20.0f ? groundSpeed : 0.0f;  // read by the GetDesiredSpeed hook
+		g_speedSlots[0].proc = actor->currentProcess;
 		actor->SetGraphVariableFloat("Speed", groundSpeed > 20.0f ? groundSpeed : 0.0f);
 		actor->SetGraphVariableFloat("Direction", p.dir);
 		actor->SetGraphVariableBool("IsSprinting", p.sprint != 0);
@@ -1442,6 +1874,7 @@ namespace Sync
 		UnswapFace();
 		g_noSwapUntil = std::chrono::steady_clock::now() + std::chrono::seconds(3);
 		DespawnPuppet();
+		DropEnemies(true);  // copies are runtime refs: keep them out of the save
 	}
 
 	void OnPreLoad()
@@ -1453,6 +1886,9 @@ namespace Sync
 		g_faceNPC = nullptr;        // runtime-created forms don't survive a load; rebuild from the blob
 		g_faceBuiltVersion = 0;
 		g_xpSeen = -1.0f;  // a loaded save's XP isn't a gain
+		DropEnemies(false);  // the load frees our copies
+		g_enemiesSent.clear();
+		g_deadSince.clear();
 	}
 
 	void Start(const Config& a_cfg)
