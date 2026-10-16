@@ -9,7 +9,7 @@
 namespace
 {
 	// Wire format. Fixed size, little-endian (both ends are x64 Windows).
-	constexpr std::uint32_t kMagic = 0x374F3446;  // "F4O7" (0.11: workshop builds; gifts must not reach builds that drop them)
+	constexpr std::uint32_t kMagic = 0x384F3446;  // "F4O8" (0.11.8: gifts carry weapon/armor mods; older builds would drop them)
 	enum class Type : std::uint8_t { kState = 1, kKill = 2, kDamage = 3, kXP = 4, kName = 5, kGive = 6, kLook = 7, kFace = 8, kBuild = 9 };
 
 #pragma pack(push, 1)
@@ -63,6 +63,13 @@ namespace
 		Type          type;
 		RE::TESFormID item;   // base item form (same in both games with the same mods)
 		std::int32_t  count;
+		std::uint8_t  modCount;  // attached weapon/armor mods (receiver, scope, lining, legendary...)
+		struct Mod
+		{
+			RE::TESFormID id;  // OMOD form
+			std::uint8_t  index;
+			std::uint8_t  rank;
+		} mods[16];
 	};
 
 	constexpr int kMaxWorn = 24;
@@ -225,7 +232,7 @@ namespace
 			                    std::all_of(nm.name, nm.name + std::strlen(nm.name), [](char c) { return static_cast<unsigned char>(c) >= 0x20; });
 			GivePacket gv{};
 			const bool isGive = n == sizeof(gv) && (std::memcpy(&gv, buf, sizeof(gv)), gv.magic == kMagic && gv.type == Type::kGive &&
-			                                         (gv.item >> 24) != 0xFF && gv.count > 0 && gv.count <= 100000);
+			                                         (gv.item >> 24) != 0xFF && gv.count > 0 && gv.count <= 100000 && gv.modCount <= std::size(gv.mods));
 			LookPacket lk{};
 			const bool isLook = n == sizeof(lk) && (std::memcpy(&lk, buf, sizeof(lk)), lk.magic == kMagic && lk.type == Type::kLook &&
 			                                         lk.count <= kMaxWorn && lk.female <= 1);
@@ -750,7 +757,6 @@ namespace
 	}
 
 	// Main thread: send items we dropped next to the puppet, once the dropped copy is gone here.
-	// shortcut: only the base item travels (weapon/armor mods and legendary effects are lost); send instance data later.
 	void SendGifts()
 	{
 		for (const auto& d : g_drops) {
@@ -760,11 +766,17 @@ namespace
 				REX::WARN("Give: dropped {:08X} not found; leaving it on the ground", d.ref);
 				continue;
 			}
+			GivePacket g{ kMagic, Type::kGive, d.item, d.count };
+			const auto inst = ref->extraList ? ref->extraList->GetByType<RE::BGSObjectInstanceExtra>() : nullptr;
+			for (const auto& m : inst ? inst->GetIndexData() : std::span<RE::BGSMod::ObjectIndexData>{}) {
+				if (!m.disabled && (m.objectID >> 24) != 0xFF && g.modCount < std::size(g.mods)) {
+					g.mods[g.modCount++] = { m.objectID, m.index, m.rank };
+				}
+			}
 			ref->Disable();
 			ref->SetDelete(true);
-			const GivePacket g{ kMagic, Type::kGive, d.item, d.count };
 			SendTo(&g, sizeof(g));
-			const auto msg = std::format("Gave {} x{} to {}", ItemName(item), d.count, g_shownName.empty() ? "your friend" : g_shownName);
+			const auto msg = std::format("Gave {} x{} ({} mods) to {}", ItemName(item), d.count, g.modCount, g_shownName.empty() ? "your friend" : g_shownName);
 			RE::SendHUDMessage::ShowHUDMessage(msg.c_str(), nullptr, false, false);
 			REX::INFO("{}", msg);
 		}
@@ -789,8 +801,40 @@ namespace
 				REX::WARN("Gift {:08X} isn't an item in this game (different mods?)", g.item);
 				continue;
 			}
-			a_player->AddInventoryItem(obj, nullptr, static_cast<std::uint32_t>(g.count), nullptr, nullptr, nullptr);
+			std::uint32_t attached = 0;
+			if (g.modCount == 0) {
+				a_player->AddInventoryItem(obj, nullptr, static_cast<std::uint32_t>(g.count), nullptr, nullptr, nullptr);
+			} else {
+				// Modded: place each one at our feet, attach the mods the way the game does, then pick it up, so the
+				// game itself moves the item with its instance data into the inventory.
+				const auto cell = a_player->GetParentCell();
+				for (std::int32_t i = 0; i < (std::min)(g.count, 50); ++i) {
+					RE::NEW_REFR_DATA d;
+					d.location = a_player->GetPosition();
+					d.object = obj;
+					d.interior = cell && cell->IsInterior() ? cell : nullptr;
+					d.world = cell && !cell->IsInterior() ? cell->worldSpace : nullptr;
+					d.clearStillLoadingFlag = true;
+					const auto ref = RE::TESDataHandler::GetSingleton()->CreateReferenceAtLocation(d).get();
+					if (!ref) {
+						REX::WARN("Gift {:08X}: couldn't place the item; added without mods", g.item);
+						a_player->AddInventoryItem(obj, nullptr, 1, nullptr, nullptr, nullptr);
+						continue;
+					}
+					for (std::uint8_t m = 0; m < g.modCount; ++m) {
+						const auto modForm = RE::TESForm::GetFormByID(g.mods[m].id);
+						if (modForm && modForm->GetFormType() == RE::ENUM_FORM_ID::kOMOD &&
+							RE::BGSObjectInstanceExtra::AttachModToReference(*ref, *static_cast<RE::BGSMod::Attachment::Mod*>(modForm), g.mods[m].index, g.mods[m].rank)) {
+							attached += i == 0;
+						}
+					}
+					a_player->PickUpObject(ref.get(), 1, false);
+				}
+			}
 			const auto msg = std::format("Received {} x{} from {}", ItemName(form), g.count, g_shownName.empty() ? "your friend" : g_shownName);
+			if (g.modCount) {
+				REX::INFO("Gift {:08X}: attached {}/{} mods", g.item, attached, g.modCount);
+			}
 			RE::SendHUDMessage::ShowHUDMessage(msg.c_str(), nullptr, false, false);
 			REX::INFO("{}", msg);
 		}
